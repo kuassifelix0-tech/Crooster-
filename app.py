@@ -164,6 +164,10 @@ def bot_polling():
 def index():
     return send_from_directory(BASE_DIR, 'index.html')
 
+@app.get('/crooster_character.png')
+def crooster_character():
+    return send_from_directory(BASE_DIR, 'crooster_character.png')
+
 @app.get('/health')
 def health():
     return jsonify({'ok': True, 'app': 'CROOSTER', 'bot_configured': bool(BOT_TOKEN), 'webapp_url_configured': bool(WEBAPP_URL)})
