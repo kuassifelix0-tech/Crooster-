@@ -162,7 +162,7 @@ def bot_polling():
 
 @app.get('/')
 def index():
-    return send_from_directory('static', 'index.html')
+    return send_from_directory(BASE_DIR, 'index.html')
 
 @app.get('/health')
 def health():
