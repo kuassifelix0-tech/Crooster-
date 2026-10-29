@@ -1,4 +1,6 @@
 import os, time, json, hmac, hashlib, sqlite3, threading, requests
+import psycopg
+from psycopg.rows import dict_row
 from urllib.parse import parse_qsl
 from flask import Flask, request, jsonify, send_from_directory
 
@@ -8,7 +10,7 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
 BOT_USERNAME = os.environ.get('BOT_USERNAME', '').strip().lstrip('@')
 WEBAPP_URL = os.environ.get('WEBAPP_URL', '').strip()
 DEV_MODE = os.environ.get('DEV_MODE', 'false').lower() == 'true'
-PAID_ENABLED = os.environ.get('ENABLE_PAID_PURCHASES', 'false').lower() == 'true'
+PAID_ENABLED = False  # Keep purchases disabled until separate payment and persistence audit
 app = Flask(__name__, static_folder='static')
 DB_LOCK = threading.Lock()
 ENERGY_MAX = 500
@@ -23,7 +25,35 @@ ITEMS = {'hoodie': 4, 'hairstyle': 4, 'sneakers': 5, 'sunglasses': 5, 'chain': 6
 
 
 
+# Set DATABASE_URL on Render only after the Neon schema is ready.
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+
+class PGCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+    def execute(self, sql, params=None):
+        if sql.strip().upper() == 'BEGIN IMMEDIATE':
+            # psycopg opens a transaction automatically on the first statement.
+            return self
+        self._cursor.execute(sql.replace('?', '%s'), params)
+        return self
+    def fetchone(self): return self._cursor.fetchone()
+    def fetchall(self): return self._cursor.fetchall()
+    @property
+    def rowcount(self): return self._cursor.rowcount
+
+class PGConnection:
+    def __init__(self):
+        self._conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=12)
+    def cursor(self): return PGCursor(self._conn.cursor())
+    def execute(self, sql, params=None): return self.cursor().execute(sql, params)
+    def commit(self): self._conn.commit()
+    def rollback(self): self._conn.rollback()
+    def close(self): self._conn.close()
+
 def db():
+    if DATABASE_URL:
+        return PGConnection()
     conn = sqlite3.connect(DB_PATH, timeout=20)
     conn.row_factory = sqlite3.Row
     return conn
@@ -32,26 +62,62 @@ def db():
 def init_db():
     with DB_LOCK:
         con = db()
-        con.executescript('''
-        CREATE TABLE IF NOT EXISTS players (
-            telegram_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-            points INTEGER NOT NULL DEFAULT 0, energy INTEGER NOT NULL DEFAULT 500,
-            energy_updated REAL NOT NULL DEFAULT 0, last_daily REAL NOT NULL DEFAULT 0,
-            inviter_id INTEGER, referrals INTEGER NOT NULL DEFAULT 0,
-            created_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_points ON players(points DESC);
-        ''')
-        cols = {r['name'] for r in con.execute('PRAGMA table_info(players)')}
-        if 'game_stars' not in cols:
-            con.execute('ALTER TABLE players ADD COLUMN game_stars INTEGER NOT NULL DEFAULT 0')
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS owned_items (telegram_id INTEGER NOT NULL, item_id TEXT NOT NULL, purchased_at REAL NOT NULL, PRIMARY KEY(telegram_id,item_id));
-        CREATE TABLE IF NOT EXISTS star_payments (charge_id TEXT PRIMARY KEY, telegram_id INTEGER NOT NULL, payload TEXT NOT NULL, xtr_amount INTEGER NOT NULL, game_stars INTEGER NOT NULL, credited_at REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS equipped_items (telegram_id INTEGER NOT NULL, slot TEXT NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY(telegram_id,slot));
-        CREATE TABLE IF NOT EXISTS pending_invoices (payload TEXT PRIMARY KEY, telegram_id INTEGER NOT NULL, bundle_id TEXT NOT NULL, created_at REAL NOT NULL);
-        """)
-        con.commit(); con.close()
+        try:
+            if DATABASE_URL:
+                statements = [
+                    """CREATE TABLE IF NOT EXISTS players (
+                        telegram_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
+                        points BIGINT NOT NULL DEFAULT 0, energy BIGINT NOT NULL DEFAULT 500,
+                        energy_updated DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        last_daily DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        inviter_id BIGINT, referrals BIGINT NOT NULL DEFAULT 0,
+                        created_at DOUBLE PRECISION NOT NULL,
+                        game_stars BIGINT NOT NULL DEFAULT 0)""",
+                    'ALTER TABLE players ADD COLUMN IF NOT EXISTS game_stars BIGINT NOT NULL DEFAULT 0',
+                    'CREATE INDEX IF NOT EXISTS idx_points ON players(points DESC)',
+                    """CREATE TABLE IF NOT EXISTS owned_items (
+                        telegram_id BIGINT NOT NULL, item_id TEXT NOT NULL,
+                        purchased_at DOUBLE PRECISION NOT NULL,
+                        PRIMARY KEY(telegram_id,item_id))""",
+                    """CREATE TABLE IF NOT EXISTS star_payments (
+                        charge_id TEXT PRIMARY KEY, telegram_id BIGINT NOT NULL,
+                        payload TEXT NOT NULL, xtr_amount BIGINT NOT NULL,
+                        game_stars BIGINT NOT NULL, credited_at DOUBLE PRECISION NOT NULL)""",
+                    """CREATE TABLE IF NOT EXISTS equipped_items (
+                        telegram_id BIGINT NOT NULL, slot TEXT NOT NULL, item_id TEXT NOT NULL,
+                        PRIMARY KEY(telegram_id,slot))""",
+                    """CREATE TABLE IF NOT EXISTS pending_invoices (
+                        payload TEXT PRIMARY KEY, telegram_id BIGINT NOT NULL,
+                        bundle_id TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL)"""
+                ]
+                for statement in statements:
+                    con.execute(statement)
+            else:
+                con.executescript('''
+                CREATE TABLE IF NOT EXISTS players (
+                    telegram_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+                    points INTEGER NOT NULL DEFAULT 0, energy INTEGER NOT NULL DEFAULT 500,
+                    energy_updated REAL NOT NULL DEFAULT 0, last_daily REAL NOT NULL DEFAULT 0,
+                    inviter_id INTEGER, referrals INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_points ON players(points DESC);
+                ''')
+                cols = {r['name'] for r in con.execute('PRAGMA table_info(players)')}
+                if 'game_stars' not in cols:
+                    con.execute('ALTER TABLE players ADD COLUMN game_stars INTEGER NOT NULL DEFAULT 0')
+                con.executescript("""
+                CREATE TABLE IF NOT EXISTS owned_items (telegram_id INTEGER NOT NULL, item_id TEXT NOT NULL, purchased_at REAL NOT NULL, PRIMARY KEY(telegram_id,item_id));
+                CREATE TABLE IF NOT EXISTS star_payments (charge_id TEXT PRIMARY KEY, telegram_id INTEGER NOT NULL, payload TEXT NOT NULL, xtr_amount INTEGER NOT NULL, game_stars INTEGER NOT NULL, credited_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS equipped_items (telegram_id INTEGER NOT NULL, slot TEXT NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY(telegram_id,slot));
+                CREATE TABLE IF NOT EXISTS pending_invoices (payload TEXT PRIMARY KEY, telegram_id INTEGER NOT NULL, bundle_id TEXT NOT NULL, created_at REAL NOT NULL);
+                """)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
 
 
 def verify_init_data(init_data):
@@ -95,6 +161,7 @@ def get_user():
 def ensure_player(user, inviter_id=None):
     uid = int(user['id'])
     con = db(); cur = con.cursor()
+    if DATABASE_URL: cur.execute('SELECT pg_advisory_xact_lock(?)', (uid,))
     cur.execute('SELECT telegram_id FROM players WHERE telegram_id=?', (uid,))
     existing = cur.fetchone()
     if not existing:
@@ -292,7 +359,7 @@ def tap():
     user = get_user()
     if not user: return jsonify({'error':'Telegram authentication failed.'}), 401
     uid=int(user['id']); ensure_player(user)
-    con=db(); con.execute('BEGIN IMMEDIATE'); cur=con.cursor(); cur.execute('SELECT points,energy,energy_updated FROM players WHERE telegram_id=?',(uid,)); row=cur.fetchone()
+    con=db(); con.execute('BEGIN IMMEDIATE'); cur=con.cursor(); cur.execute('SELECT points,energy,energy_updated FROM players WHERE telegram_id=?' + (' FOR UPDATE' if DATABASE_URL else ''),(uid,)); row=cur.fetchone()
     now=time.time(); energy=min(ENERGY_MAX, row['energy']+int(max(0,now-row['energy_updated'])*ENERGY_REGEN_PER_SEC))
     taps=request.json.get('taps',1) if request.is_json else 1
     try: taps=max(1,min(20,int(taps)))
@@ -310,7 +377,7 @@ def daily():
     user=get_user()
     if not user: return jsonify({'error':'Telegram authentication failed.'}),401
     uid=int(user['id']); ensure_player(user); now=time.time(); con=db(); con.execute('BEGIN IMMEDIATE'); cur=con.cursor()
-    cur.execute('SELECT last_daily FROM players WHERE telegram_id=?',(uid,)); row=cur.fetchone()
+    cur.execute('SELECT last_daily FROM players WHERE telegram_id=?' + (' FOR UPDATE' if DATABASE_URL else ''),(uid,)); row=cur.fetchone()
     if now-row['last_daily'] < 86400:
         con.close(); return jsonify({'error':'Your daily reward is not ready yet.'}), 400
     cur.execute('UPDATE players SET points=points+?,last_daily=? WHERE telegram_id=?',(DAILY_REWARD,now,uid)); con.commit(); con.close()
